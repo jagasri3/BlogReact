@@ -1,0 +1,153 @@
+name: Project 4 CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 851725554910.dkr.ecr.ap-south-1.amazonaws.com
+  FRONTEND_IMAGE: 851725554910.dkr.ecr.ap-south-1.amazonaws.com/blog-frontend
+  BACKEND_IMAGE: 851725554910.dkr.ecr.ap-south-1.amazonaws.com/blog-backend
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-test-scan-deploy:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Frontend install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Backend install
+        working-directory: backend
+        run: npm install
+
+      - name: Backend test
+        working-directory: backend
+        run: npm test -- --runInBand
+
+      - name: Backend lint
+        working-directory: backend
+        run: npm run lint
+
+      - name: SonarQube Analysis and Quality Gate
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Docker build frontend
+        run: docker build -t $FRONTEND_IMAGE:$IMAGE_TAG ./frontend
+
+      - name: Docker build backend
+        run: docker build -t $BACKEND_IMAGE:$IMAGE_TAG ./backend
+
+      - name: Trivy scan frontend
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ env.FRONTEND_IMAGE }}:${{ env.IMAGE_TAG }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+          vuln-type: os,library
+          output: trivy-frontend.txt
+
+      - name: Trivy scan backend
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ env.BACKEND_IMAGE }}:${{ env.IMAGE_TAG }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+          vuln-type: os,library
+          output: trivy-backend.txt
+
+      - name: Show Trivy results
+        run: |
+          echo "===== FRONTEND TRIVY ====="
+          cat trivy-frontend.txt
+          echo "===== BACKEND TRIVY ====="
+          cat trivy-backend.txt
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-reports-${{ github.sha }}
+          path: |
+            trivy-frontend.txt
+            trivy-backend.txt
+          retention-days: 30
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push versioned frontend image
+        run: docker push $FRONTEND_IMAGE:$IMAGE_TAG
+
+      - name: Push versioned backend image
+        run: docker push $BACKEND_IMAGE:$IMAGE_TAG
+
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name blog-eks --region $AWS_REGION
+
+      - name: Deploy frontend
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=$FRONTEND_IMAGE:$IMAGE_TAG \
+            -n blogapp
+          kubectl rollout status deployment/frontend \
+            -n blogapp --timeout=180s
+
+      - name: Deploy backend
+        run: |
+          kubectl set image deployment/backend \
+            backend=$BACKEND_IMAGE:$IMAGE_TAG \
+            -n blogapp
+          kubectl rollout status deployment/backend \
+            -n blogapp --timeout=180s
+
+      - name: Deployment validation
+        run: |
+          kubectl get pods,svc -n blogapp
+          kubectl get deployment frontend backend -n blogapp
+          APP_HOST=$(kubectl get svc frontend-service -n blogapp -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Application URL: http://$APP_HOST"
+          curl -fsS --max-time 30 "http://$APP_HOST" >/dev/null
+          echo "Application validation successful"
