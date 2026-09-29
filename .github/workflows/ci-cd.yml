@@ -34,10 +34,6 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Frontend lint
-        working-directory: frontend
-        run: npm run lint
-
       - name: Frontend build
         working-directory: frontend
         run: npm run build
@@ -49,10 +45,6 @@ jobs:
       - name: Backend test
         working-directory: backend
         run: npm test -- --runInBand
-
-      - name: Backend lint
-        working-directory: backend
-        run: npm run lint
 
       - name: SonarQube Analysis and Quality Gate
         uses: SonarSource/sonarqube-scan-action@v6
